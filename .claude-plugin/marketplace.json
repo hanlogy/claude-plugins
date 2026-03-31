@@ -1,0 +1,14 @@
+{
+  "name": "hanlogy-plugins",
+  "owner": {
+    "name": "Hanlogy",
+    "email": "info@hanlogy.com"
+  },
+  "plugins": [
+    {
+      "name": "steering-log",
+      "source": "./plugins/steering-log",
+      "description": "A Claude Code plugin that automatically detects and logs human steering moments from AI-assisted development sessions."
+    }
+  ]
+}
