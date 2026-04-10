@@ -25,13 +25,14 @@ __export(runDetector_exports, {
 module.exports = __toCommonJS(runDetector_exports);
 
 // src/constants.ts
-var HAIKU_MODEL = "claude-haiku-4-5-20251001";
+var DETECTOR_MODEL = "claude-haiku-4-5-20251001";
 var STEERING_LOG_DIR = "steering_log";
 var CONVERSATION_DIR = ".conversation";
 var BUFFER_FILE = "buffer.jsonl";
 var TRIGGERS_QUEUE_FILE = "triggers-queue.txt";
 var DETECTOR_CONTEXT_FILE = "detector-context.json";
 var SUMMARIZER_CONTEXT_FILE = "summarizer-context.json";
+var AGENT_MAX_RETRIES = 2;
 var SCRIPTS_DIR = "scripts/";
 var RUN_SUMMARIZER_SCRIPT = "runSummarizer.js";
 
@@ -249,24 +250,46 @@ function writeTriggersQueue(cwd2, { timestamp }) {
 
 // src/helpers/extractJsonRecord.ts
 function extractJsonRecord(input) {
-  const end = input.lastIndexOf("}");
-  if (end < 0) {
-    return null;
-  }
-  let pos = 0;
-  while (pos <= end) {
-    const start = input.indexOf("{", pos);
-    if (start < 0 || start > end) {
-      break;
+  for (let i = 0; i < input.length; i++) {
+    if (input[i] !== "{") {
+      continue;
     }
-    try {
-      const data = JSON.parse(input.slice(start, end + 1));
-      if (isJsonRecord(data)) {
-        return data;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let j = i; j < input.length; j++) {
+      const ch = input[j];
+      if (escape) {
+        escape = false;
+        continue;
       }
-    } catch {
+      if (ch === "\\" && inString) {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) {
+        continue;
+      }
+      if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const data = JSON.parse(input.slice(i, j + 1));
+            if (isJsonRecord(data)) {
+              return data;
+            }
+          } catch {
+          }
+          break;
+        }
+      }
     }
-    pos = start + 1;
   }
   return null;
 }
@@ -308,10 +331,32 @@ function spawnSummarizerScript(cwd2) {
 
 // src/helpers/spawnAgents.ts
 var import_child_process2 = require("child_process");
+var import_fs7 = require("fs");
+var import_path3 = require("path");
 function spawnAgent({
   model,
-  prompt
+  prompt,
+  agentName,
+  cwd: cwd2,
+  attempt
 }) {
+  if (process.env["CLAUDE_PLUGIN_OPTION_DEBUG_PROMPTS"] === "true") {
+    try {
+      const { conversationDir } = buildPaths(cwd2);
+      (0, import_fs7.mkdirSync)(conversationDir, { recursive: true });
+      const logPath = (0, import_path3.join)(conversationDir, `${agentName}-prompts.log`);
+      (0, import_fs7.appendFileSync)(
+        logPath,
+        `${(/* @__PURE__ */ new Date()).toISOString()}, attempt: ${attempt}
+${prompt}
+
+---
+
+`
+      );
+    } catch {
+    }
+  }
   const result = (0, import_child_process2.spawnSync)("claude", ["--print", "--model", model], {
     input: prompt,
     encoding: "utf8",
@@ -325,8 +370,12 @@ function spawnAgent({
   }
   return result.stdout;
 }
-function spawnDetectorAgent(prompt) {
-  return spawnAgent({ model: HAIKU_MODEL, prompt });
+function spawnDetectorAgent(options) {
+  return spawnAgent({
+    model: DETECTOR_MODEL,
+    agentName: "detector",
+    ...options
+  });
 }
 
 // src/scripts/runDetector.ts
@@ -349,8 +398,9 @@ function runDetector(cwd2) {
       break;
     }
     lastTimestamp = humanMessage.timestamp;
-    const agentOutput = parseDetectorAgentOutput(
-      spawnDetectorAgent(buildPrompt(context.messages))
+    const agentOutput = runDetectorWithRetry(
+      cwd2,
+      buildPrompt(context.messages)
     );
     if (agentOutput === null) {
       advance();
@@ -362,6 +412,17 @@ function runDetector(cwd2) {
     }
     advance();
   }
+}
+function runDetectorWithRetry(cwd2, prompt) {
+  let agentOutput = parseDetectorAgentOutput(
+    spawnDetectorAgent({ cwd: cwd2, prompt, attempt: 1 })
+  );
+  for (let attempt = 2; agentOutput === null && attempt <= AGENT_MAX_RETRIES + 1; attempt++) {
+    agentOutput = parseDetectorAgentOutput(
+      spawnDetectorAgent({ cwd: cwd2, prompt, attempt })
+    );
+  }
+  return agentOutput;
 }
 function buildPrompt(messages) {
   const formatted = messages.map(({ role, content }) => `[${role}]: ${content}`).join("\n\n");
@@ -383,8 +444,11 @@ Do NOT classify as a trigger:
 - Confusion or requests for clarification ("what?", "huh?", "can you explain")
 - Social acknowledgement ("ok", "maybe you're right", "I see")
 - Follow-up questions that continue the same topic
-- Additive follow-on requests that extend what was just built without rejecting or
-  correcting anything ("can we also X?", "how about adding Y?")
+- Additive follow-on requests unless they are a direct prompt for action that
+  changes the shape of what was just built \u2014 its type signature, interface, or
+  design. If it is a question, discussion, or adds context without demanding a
+  redesign, it is not a trigger ("can you add a comment?", "what about X?",
+  "I think we might need Y")
 - Selecting from options that Claude offered ("yes, option 2", "the second one")
 
 The bar is high. When in doubt, return false.
