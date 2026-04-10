@@ -25,7 +25,7 @@ __export(runSummarizer_exports, {
 module.exports = __toCommonJS(runSummarizer_exports);
 
 // src/constants.ts
-var SONNET_MODEL = "claude-sonnet-4-6";
+var SUMMARIZER_MODEL = "claude-sonnet-4-6";
 var STEERING_LOG_DIR = "steering_log";
 var CONVERSATION_DIR = ".conversation";
 var BUFFER_FILE = "buffer.jsonl";
@@ -43,9 +43,9 @@ var EPISODE_RESULTS = [
   "completed",
   "paused",
   "cancelled",
-  "failed",
-  "unknown"
+  "failed"
 ];
+var AGENT_MAX_RETRIES = 2;
 
 // src/helpers/buildPaths.ts
 var import_path = require("path");
@@ -92,24 +92,46 @@ function isOneOf(arr, item) {
 
 // src/helpers/extractJsonRecord.ts
 function extractJsonRecord(input) {
-  const end = input.lastIndexOf("}");
-  if (end < 0) {
-    return null;
-  }
-  let pos = 0;
-  while (pos <= end) {
-    const start = input.indexOf("{", pos);
-    if (start < 0 || start > end) {
-      break;
+  for (let i = 0; i < input.length; i++) {
+    if (input[i] !== "{") {
+      continue;
     }
-    try {
-      const data = JSON.parse(input.slice(start, end + 1));
-      if (isJsonRecord(data)) {
-        return data;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let j = i; j < input.length; j++) {
+      const ch = input[j];
+      if (escape) {
+        escape = false;
+        continue;
       }
-    } catch {
+      if (ch === "\\" && inString) {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) {
+        continue;
+      }
+      if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const data = JSON.parse(input.slice(i, j + 1));
+            if (isJsonRecord(data)) {
+              return data;
+            }
+          } catch {
+          }
+          break;
+        }
+      }
     }
-    pos = start + 1;
   }
   return null;
 }
@@ -156,7 +178,7 @@ function parseSummarizerAgentOutput(stdout) {
   return {
     isMoment: true,
     isNewEpisode: true,
-    previousResult: isOneOf(EPISODE_RESULTS, previous_result) ? previous_result : "unknown",
+    previousResult: isOneOf(EPISODE_RESULTS, previous_result) ? previous_result : void 0,
     topic,
     type,
     judgment,
@@ -399,17 +421,39 @@ function findLatestEpisode(steeringLogDir) {
   if (!(0, import_fs7.existsSync)(steeringLogDir)) {
     return null;
   }
-  const files = (0, import_fs7.readdirSync)(steeringLogDir).filter((f) => f.endsWith(".md")).sort();
+  const files = (0, import_fs7.readdirSync)(steeringLogDir).filter((f) => f.endsWith(".md") && !f.endsWith(".transcript.md")).sort();
   const last = files[files.length - 1];
   return last ? (0, import_path2.join)(steeringLogDir, last) : null;
 }
 
 // src/helpers/spawnAgents.ts
 var import_child_process = require("child_process");
+var import_fs8 = require("fs");
+var import_path3 = require("path");
 function spawnAgent({
   model,
-  prompt
+  prompt,
+  agentName,
+  cwd: cwd2,
+  attempt
 }) {
+  if (process.env["CLAUDE_PLUGIN_OPTION_DEBUG_PROMPTS"] === "true") {
+    try {
+      const { conversationDir } = buildPaths(cwd2);
+      (0, import_fs8.mkdirSync)(conversationDir, { recursive: true });
+      const logPath = (0, import_path3.join)(conversationDir, `${agentName}-prompts.log`);
+      (0, import_fs8.appendFileSync)(
+        logPath,
+        `${(/* @__PURE__ */ new Date()).toISOString()}, attempt: ${attempt}
+${prompt}
+
+---
+
+`
+      );
+    } catch {
+    }
+  }
   const result = (0, import_child_process.spawnSync)("claude", ["--print", "--model", model], {
     input: prompt,
     encoding: "utf8",
@@ -423,35 +467,39 @@ function spawnAgent({
   }
   return result.stdout;
 }
-function spawnSummarizerAgent(prompt) {
-  return spawnAgent({ model: SONNET_MODEL, prompt });
+function spawnSummarizerAgent(options) {
+  return spawnAgent({
+    model: SUMMARIZER_MODEL,
+    agentName: "summarizer",
+    ...options
+  });
 }
 
 // src/scripts/runSummarizer.ts
-var import_fs10 = require("fs");
-var import_path3 = require("path");
+var import_fs12 = require("fs");
+var import_path4 = require("path");
 
 // src/helpers/completeEpisode.ts
-var import_fs8 = require("fs");
+var import_fs9 = require("fs");
 function completeEpisode({
   path,
   result
 }) {
-  if (!path || !(0, import_fs8.existsSync)(path)) {
+  if (!path || !(0, import_fs9.existsSync)(path)) {
     return;
   }
-  const content = (0, import_fs8.readFileSync)(path, "utf-8");
+  const content = (0, import_fs9.readFileSync)(path, "utf-8");
   if (!content.trimEnd().match(/\*\*Result\*\*:\s*\S+\s*$/)) {
-    (0, import_fs8.appendFileSync)(path, `
+    (0, import_fs9.appendFileSync)(path, `
 
 ---
 
-**Result**: ${result}`);
+**Result**: ${result ?? "unknown"}`);
   }
 }
 
 // src/helpers/writeMoment.ts
-var import_fs9 = require("fs");
+var import_fs10 = require("fs");
 function writeMoment(output, triggerTimestamp, episodePath) {
   const { year, month, day, hours, minutes } = getDateParts(triggerTimestamp);
   const datetime = `${year}-${month}-${day} ${hours}:${minutes}`;
@@ -466,14 +514,55 @@ ${judgment}`,
 ${context}`
   ].join("\n\n");
   if (output.isNewEpisode) {
-    (0, import_fs9.writeFileSync)(episodePath, `# ${output.topic}
+    (0, import_fs10.writeFileSync)(episodePath, `# ${output.topic}
 
 ${moment}
 `);
   } else {
-    (0, import_fs9.appendFileSync)(episodePath, `
+    (0, import_fs10.appendFileSync)(episodePath, `
 
 ${moment}
+`);
+  }
+}
+
+// src/helpers/writeTranscript.ts
+var import_fs11 = require("fs");
+function formatMessage(message) {
+  const { year, month, day, hours, minutes, seconds } = getDateParts(
+    message.timestamp
+  );
+  const datetime = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+  return `[${message.role} ${datetime}]:
+${message.content}`;
+}
+function writeTranscript({
+  messages,
+  triggerTimestamp,
+  episodePath,
+  isNewEpisode,
+  type,
+  topic
+}) {
+  const transcriptPath = episodePath.replace(/\.md$/, ".transcript.md");
+  const { year, month, day, hours, minutes } = getDateParts(triggerTimestamp);
+  const datetime = `${year}-${month}-${day} ${hours}:${minutes}`;
+  const section = [
+    `## ${datetime} ${type}`,
+    ...messages.map(formatMessage)
+  ].join("\n\n");
+  if (isNewEpisode) {
+    const heading = topic ? `# ${topic}
+
+` : "";
+    (0, import_fs11.writeFileSync)(transcriptPath, `${heading}${section}
+`);
+  } else {
+    (0, import_fs11.appendFileSync)(transcriptPath, `
+
+---
+
+${section}
 `);
   }
 }
@@ -500,19 +589,17 @@ function runSummarizer(cwd2) {
     }
     lastTimestamp = trigger.timestamp;
     const latestEpisode = findLatestEpisode(steeringLogDir);
-    const episodeContent = latestEpisode && (0, import_fs10.existsSync)(latestEpisode) ? (0, import_fs10.readFileSync)(latestEpisode, "utf-8") : void 0;
-    const parsed = parseSummarizerAgentOutput(
-      spawnSummarizerAgent(buildPrompt(context, episodeContent))
+    const episodeContent = latestEpisode && (0, import_fs12.existsSync)(latestEpisode) ? (0, import_fs12.readFileSync)(latestEpisode, "utf-8") : void 0;
+    const parsed = runSummarizerWithRetry(
+      cwd2,
+      buildPrompt(context, episodeContent)
     );
-    if (
-      // TODO: retry on null before advancing (transient agent failure)
-      !parsed?.isMoment || // Agent returned same-episode but no episode exists — inconsistent response, skip.
-      !parsed.isNewEpisode && !latestEpisode
-    ) {
+    if (!parsed?.isMoment || // Agent returned same-episode but no episode exists — inconsistent response, skip.
+    !parsed.isNewEpisode && !latestEpisode) {
       advance();
       continue;
     }
-    const episodePath = parsed.isNewEpisode ? (0, import_path3.join)(
+    const episodePath = parsed.isNewEpisode ? (0, import_path4.join)(
       steeringLogDir,
       buildEpisodeFileName(trigger.timestamp, parsed.topic)
     ) : latestEpisode;
@@ -527,8 +614,29 @@ function runSummarizer(cwd2) {
       });
     }
     writeMoment(parsed, trigger.timestamp, episodePath);
+    if (process.env["CLAUDE_PLUGIN_OPTION_SAVE_TRANSCRIPT"] === "true") {
+      writeTranscript({
+        messages: context.messages,
+        triggerTimestamp: trigger.timestamp,
+        episodePath,
+        isNewEpisode: parsed.isNewEpisode,
+        type: parsed.type,
+        topic: parsed.isNewEpisode ? parsed.topic : void 0
+      });
+    }
     advance();
   }
+}
+function runSummarizerWithRetry(cwd2, prompt) {
+  let agentOutput = parseSummarizerAgentOutput(
+    spawnSummarizerAgent({ cwd: cwd2, prompt, attempt: 1 })
+  );
+  for (let attempt = 2; agentOutput === null && attempt <= AGENT_MAX_RETRIES + 1; attempt++) {
+    agentOutput = parseSummarizerAgentOutput(
+      spawnSummarizerAgent({ cwd: cwd2, prompt, attempt })
+    );
+  }
+  return agentOutput;
 }
 function buildPrompt(context, episodeContent) {
   const messages = context.messages.map(({ role, content }) => `[${role}]: ${content}`).join("\n\n");
@@ -560,8 +668,11 @@ A moment is worth logging when the developer makes a deliberate technical or pro
 - preference: asserts a specific way of doing things
 
 NOT a moment:
-(1) Additive follow-on requests that simply extend what was just built without
-    rejecting or correcting anything \u2014 the developer is just asking for more.
+(1) Additive follow-on requests, unless they are a direct prompt for action that
+    changes the shape of what was just built \u2014 its type signature, interface, or
+    design. Questions, discussion, or messages that add context without demanding
+    a redesign are not moments ("can you add a comment?", "what about X?",
+    "I think we might need Y").
 (2) Weak or incidental signals that, within the context of the full conversation,
     carry no meaningful steering weight \u2014 a passing remark, a minor wording tweak,
     or a throwaway preference that would not matter in a future session.
@@ -570,8 +681,10 @@ A new episode begins when the current task is done, abandoned, or significantly 
 
 For \`judgment\`: one or two sentences. Lead with what the developer decided. Do not
 front-load with setup ("When Claude...", "After Claude...", "This developer..."). Do
-not restate what is in \`context\`. Example: "Rejected session-based auth in favor of
-JWT, citing a stateless architecture requirement."
+not restate what is in \`context\`. Do not include classification reasoning \u2014 never
+mention "shape", "type signature", "interface", or similar structural language unless
+the developer used those words themselves. Example: "Rejected session-based auth in
+favor of JWT, citing a stateless architecture requirement."
 
 For \`context\`: describe what Claude was doing at that moment. Include a code snippet
 (\u226410 lines) if it aids clarity.
