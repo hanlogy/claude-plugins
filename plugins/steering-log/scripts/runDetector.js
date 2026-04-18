@@ -33,6 +33,7 @@ var TRIGGERS_QUEUE_FILE = "triggers-queue.txt";
 var DETECTOR_CONTEXT_FILE = "detector-context.json";
 var SUMMARIZER_CONTEXT_FILE = "summarizer-context.json";
 var AGENT_MAX_RETRIES = 2;
+var QUALIFICATION_RULES_PLACEHOLDER = "{{QUALIFICATION_RULES}}";
 var SCRIPTS_DIR = "scripts/";
 var RUN_SUMMARIZER_SCRIPT = "runSummarizer.js";
 
@@ -378,6 +379,56 @@ function spawnDetectorAgent(options) {
   });
 }
 
+// src/prompts/detector.md
+var detector_default = 'You are reviewing a software development conversation. Determine whether the\nhuman message is a meaningful developer steering moment.\n\n{{QUALIFICATION_RULES}}\n\n## Output format\n\nReturn only JSON \u2014 no prose, no markdown: {"is_trigger": true} or {"is_trigger":\nfalse}.\n';
+
+// src/prompts/shared/momentRules.md
+var momentRules_default = `## How to qualify a moment
+
+Step 1 \u2014 classify the type:
+
+- pushback: explicitly rejects or overrides a specific AI suggestion with a
+  counter-position, alternative, or specific objection
+- correction: clarifies a genuine misunderstanding that changed the AI's direction
+- direction: gives a concrete instruction about approach, architecture, or implementation
+- scope-change: deliberately narrows, expands, or redirects the goal
+- preference: asserts a specific way of doing things ("we use X", "I prefer Y")
+
+Step 2 \u2014 apply the bar for that type:
+
+- pushback: always qualifies \u2014 it is by definition a reaction that overrides a
+  prior AI response
+- correction: always qualifies \u2014 it is by definition a response to a
+  misunderstanding
+- direction: must imply a constraint on or dissatisfaction with the current
+  approach \u2014 explicit reasoning is not required, but the message must carry a
+  signal beyond task sequencing. "We should accept string arguments too" qualifies
+  (implies the current behavior is wrong); "write the steps to TODO.md first"
+  does not (pure task ordering with no implied constraint)
+- scope-change: same bar as direction \u2014 must imply a constraint or override, not
+  just a redirect
+- preference: must carry a signal about how the developer thinks \u2014 a pure task
+  instruction does not qualify even if it technically expresses a preference
+
+Do NOT classify as a moment regardless of type:
+
+- Vague disagreement without substance ("I disagree", "that's not right", "are
+  you sure")
+- Confusion or requests for clarification ("what?", "huh?", "can you explain")
+- Social acknowledgement ("ok", "maybe you're right", "I see")
+- Follow-up questions that continue the same topic
+- Additive follow-on requests unless they demand a redesign of what was just
+  built \u2014 its type, interface, or design. Questions, discussion, or messages
+  that add context without demanding a redesign are not moments ("can you add a
+  comment?", "what about X?", "I think we might need Y")
+- Selecting from options that Claude offered ("yes, option 2", "the second one")
+- Weak or incidental signals that carry no meaningful steering weight \u2014 a passing
+  remark, a minor wording tweak, or a throwaway preference that would not matter
+  in a future session
+
+The bar is high. When in doubt, return false.
+`;
+
 // src/scripts/runDetector.ts
 var cwd = process.argv[2];
 if (!cwd) {
@@ -425,35 +476,15 @@ function runDetectorWithRetry(cwd2, prompt) {
   return agentOutput;
 }
 function buildPrompt(messages) {
-  const formatted = messages.map(({ role, content }) => `[${role}]: ${content}`).join("\n\n");
-  return `${formatted}
+  const conversation = messages.map(({ role, content }) => `[${role}]: ${content}`).join("\n\n");
+  const prompt = detector_default.replace(QUALIFICATION_RULES_PLACEHOLDER, momentRules_default);
+  return `${prompt}
 
-You are reviewing a software development conversation.
-Determine whether the human message is a meaningful developer steering moment.
+--- Conversation ---
 
-A steering moment must reflect a deliberate technical or process judgment:
-- pushback: explicitly rejects or overrides a specific AI suggestion with reasoning
-  or a counter-position
-- direction: gives a concrete instruction about approach, architecture, or implementation
-- correction: clarifies a genuine misunderstanding that changed the AI's direction
-- scope-change: deliberately narrows, expands, or redirects the goal
-- preference: asserts a specific way of doing things ("we use X", "I prefer Y")
+${conversation}
 
-Do NOT classify as a trigger:
-- Vague disagreement without substance ("I disagree", "that's not right", "are you sure")
-- Confusion or requests for clarification ("what?", "huh?", "can you explain")
-- Social acknowledgement ("ok", "maybe you're right", "I see")
-- Follow-up questions that continue the same topic
-- Additive follow-on requests unless they are a direct prompt for action that
-  changes the shape of what was just built \u2014 its type signature, interface, or
-  design. If it is a question, discussion, or adds context without demanding a
-  redesign, it is not a trigger ("can you add a comment?", "what about X?",
-  "I think we might need Y")
-- Selecting from options that Claude offered ("yes, option 2", "the second one")
-
-The bar is high. When in doubt, return false.
-
-Return only JSON \u2014 no prose, no markdown: {"is_trigger": true} or {"is_trigger": false}.`;
+--- End of Conversation ---`;
 }
 runDetector(cwd);
 // Annotate the CommonJS export names for ESM import in node:

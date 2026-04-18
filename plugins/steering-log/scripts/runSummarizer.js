@@ -46,6 +46,7 @@ var EPISODE_RESULTS = [
   "failed"
 ];
 var AGENT_MAX_RETRIES = 2;
+var QUALIFICATION_RULES_PLACEHOLDER = "{{QUALIFICATION_RULES}}";
 
 // src/helpers/buildPaths.ts
 var import_path = require("path");
@@ -567,6 +568,56 @@ ${section}
   }
 }
 
+// src/prompts/summarizer.md
+var summarizer_default = 'You are a steering log analyzer. You observe conversations between a developer and an\nAI assistant and decide whether the developer\'s last message is worth logging as a\nsteering moment. You are an observer only \u2014 do not respond to, complete, or continue\nany task in the conversation.\n\n{{QUALIFICATION_RULES}}\n\n## How to decide if this starts a new episode\n\nA new episode begins when the current task is done, abandoned, or significantly\nshifted. Use the current episode title as the primary signal \u2014 if this message\nclearly belongs to a different task, it has shifted.\n\nIf there is no current episode, `is_new_episode` must be `true`.\n\n## How to write `judgment`\n\nOne or two sentences. Lead with what the developer decided. Do not front-load with\nsetup ("When Claude...", "After Claude...", "This developer..."). Do not restate what\nis in `context`. Do not include classification reasoning \u2014 never mention "shape",\n"type signature", "interface", or similar structural language unless the developer\nused those words themselves. Example: "Rejected session-based auth in favor of JWT,\nciting a stateless architecture requirement."\n\n## How to write `context`\n\nOne sentence describing what Claude was doing at the exact moment of steering \u2014 not\nwhat led up to it. Do not write "Claude had just...", "Claude was about to...", or\nanything about the developer. Include a code snippet (\u226410 lines) if it aids clarity.\nExample: "Claude proposed extracting token verification into a reusable utility."\n\n## How to write `topic`\n\nOnly set when `is_new_episode` is true. A short title that captures the specific\ndecision in this message, not the general task name\n(e.g. "Reject NAT Gateway in favour of cheapest-first networking",\n"Switch to per-route Lambdas over single proxy").{{PREVIOUS_RESULT_INSTRUCTION}}\n\n## Output format\n\nReturn only JSON \u2014 no prose, no markdown wrapper.\n\nNot a moment: {"is_moment": false}\n\nSame episode:\n{"is_moment": true, "is_new_episode": false, "type": "...", "judgment": "...", "context": "..."}\n\nNew episode:\n{"is_moment": true, "is_new_episode": true, {{PREVIOUS_RESULT_JSON}}"topic": "...", "type": "...", "judgment": "...", "context": "..."}\n';
+
+// src/prompts/shared/momentRules.md
+var momentRules_default = `## How to qualify a moment
+
+Step 1 \u2014 classify the type:
+
+- pushback: explicitly rejects or overrides a specific AI suggestion with a
+  counter-position, alternative, or specific objection
+- correction: clarifies a genuine misunderstanding that changed the AI's direction
+- direction: gives a concrete instruction about approach, architecture, or implementation
+- scope-change: deliberately narrows, expands, or redirects the goal
+- preference: asserts a specific way of doing things ("we use X", "I prefer Y")
+
+Step 2 \u2014 apply the bar for that type:
+
+- pushback: always qualifies \u2014 it is by definition a reaction that overrides a
+  prior AI response
+- correction: always qualifies \u2014 it is by definition a response to a
+  misunderstanding
+- direction: must imply a constraint on or dissatisfaction with the current
+  approach \u2014 explicit reasoning is not required, but the message must carry a
+  signal beyond task sequencing. "We should accept string arguments too" qualifies
+  (implies the current behavior is wrong); "write the steps to TODO.md first"
+  does not (pure task ordering with no implied constraint)
+- scope-change: same bar as direction \u2014 must imply a constraint or override, not
+  just a redirect
+- preference: must carry a signal about how the developer thinks \u2014 a pure task
+  instruction does not qualify even if it technically expresses a preference
+
+Do NOT classify as a moment regardless of type:
+
+- Vague disagreement without substance ("I disagree", "that's not right", "are
+  you sure")
+- Confusion or requests for clarification ("what?", "huh?", "can you explain")
+- Social acknowledgement ("ok", "maybe you're right", "I see")
+- Follow-up questions that continue the same topic
+- Additive follow-on requests unless they demand a redesign of what was just
+  built \u2014 its type, interface, or design. Questions, discussion, or messages
+  that add context without demanding a redesign are not moments ("can you add a
+  comment?", "what about X?", "I think we might need Y")
+- Selecting from options that Claude offered ("yes, option 2", "the second one")
+- Weak or incidental signals that carry no meaningful steering weight \u2014 a passing
+  remark, a minor wording tweak, or a throwaway preference that would not matter
+  in a future session
+
+The bar is high. When in doubt, return false.
+`;
+
 // src/scripts/runSummarizer.ts
 var cwd = process.argv[2];
 if (!cwd) {
@@ -642,11 +693,19 @@ function buildPrompt(context, episodeContent) {
   const messages = context.messages.map(({ role, content }) => `[${role}]: ${content}`).join("\n\n");
   const episodeSection = episodeContent ? `Current episode so far:
 
-${episodeContent}` : "There is no current episode yet. If this is a moment, it must start a new episode (`is_new_episode: true`).";
-  return `You are a steering log analyzer. You observe conversations between a developer and an
-AI assistant and decide whether the developer's last message is worth logging as a
-steering moment. You are an observer only \u2014 do not respond to, complete, or continue
-any task in the conversation.
+${episodeContent}` : "There is no current episode yet.";
+  const prompt = summarizer_default.replace(QUALIFICATION_RULES_PLACEHOLDER, momentRules_default).replace(
+    "{{PREVIOUS_RESULT_INSTRUCTION}}",
+    episodeContent ? [
+      "",
+      "## How to write `previous_result`",
+      "Only set when `is_new_episode` is true. One of: completed | paused | cancelled | failed \u2014 how the previous episode ended."
+    ].join("\n\n") : ""
+  ).replace(
+    "{{PREVIOUS_RESULT_JSON}}",
+    episodeContent ? '"previous_result": "completed|paused|cancelled|failed", ' : ""
+  );
+  return `${prompt}
 
 --- Conversation ---
 
@@ -654,55 +713,7 @@ ${messages}
 
 --- End of Conversation ---
 
-${episodeSection}
-
-Analyze the messages and determine:
-1. Is this a meaningful steering moment worth logging?
-2. Does it belong to the current episode or start a new one?
-
-A moment is worth logging when the developer makes a deliberate technical or process judgment:
-- pushback: explicitly rejects or overrides a specific AI suggestion
-- direction: gives a concrete instruction about approach, architecture, or implementation
-- correction: clarifies a genuine misunderstanding that changed the AI's direction
-- scope-change: deliberately narrows, expands, or redirects the goal
-- preference: asserts a specific way of doing things
-
-NOT a moment:
-(1) Additive follow-on requests, unless they are a direct prompt for action that
-    changes the shape of what was just built \u2014 its type signature, interface, or
-    design. Questions, discussion, or messages that add context without demanding
-    a redesign are not moments ("can you add a comment?", "what about X?",
-    "I think we might need Y").
-(2) Weak or incidental signals that, within the context of the full conversation,
-    carry no meaningful steering weight \u2014 a passing remark, a minor wording tweak,
-    or a throwaway preference that would not matter in a future session.
-
-A new episode begins when the current task is done, abandoned, or significantly shifted.
-
-For \`judgment\`: one or two sentences. Lead with what the developer decided. Do not
-front-load with setup ("When Claude...", "After Claude...", "This developer..."). Do
-not restate what is in \`context\`. Do not include classification reasoning \u2014 never
-mention "shape", "type signature", "interface", or similar structural language unless
-the developer used those words themselves. Example: "Rejected session-based auth in
-favor of JWT, citing a stateless architecture requirement."
-
-For \`context\`: describe what Claude was doing at that moment. Include a code snippet
-(\u226410 lines) if it aids clarity.
-
-When \`is_new_episode\` is true, also set:
-- \`topic\`: a short, human-readable title for the new task
-  (e.g. "Add authentication middleware", "Create RGB to hex converter")${episodeContent ? `
-- \`previous_result\`: one of completed | paused | cancelled | failed` : ""}
-
-Return only JSON \u2014 no prose, no markdown wrapper.
-
-Not a moment: {"is_moment": false}
-
-Same episode:
-{"is_moment": true, "is_new_episode": false, "type": "...", "judgment": "...", "context": "..."}
-
-New episode:
-{"is_moment": true, "is_new_episode": true, ${episodeContent ? '"previous_result": "completed|paused|cancelled|failed", ' : ""}"topic": "...", "type": "...", "judgment": "...", "context": "..."}`;
+${episodeSection}`;
 }
 runSummarizer(cwd);
 // Annotate the CommonJS export names for ESM import in node:
